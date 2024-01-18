@@ -1,0 +1,1526 @@
+---
+title: 'Projet Ingénieur : Apparition du Cancer chez les diabetiques II'
+author: "Hadirou TAMDAMBA"
+date: "2023-11-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Collaboration : V. Mallet, Médecin hépatologue à l’APHP
+
+**Contexte:** L’alcool contribue au développement de plus de 700 maladies. On s’intéresse ici plus particulièrement aux maladies du foie, notamment du carcinome hépatocellulaire (CHC)
+
+Les patients avec un diabète de type 2 (DT2) sont à risque de CHC. Le DT2 progresse avec l’épidémie d’obésité. Une hausse du CHC est attendue. La consommation d’alcool progresse. Le nombre de patients avec un trouble d’usage d’alcool (AUD = consommation à risque) 
+
+**Jeu de données:** les hospitalisations de tous les patients DT2 sur 10 ans. Les diagnostics et les actes  sont enregistrés lors de chaque hospitalisation avec l’âge et la date de sortie
+
+**Question :**  Peut-on prévoir le risque des patients DT2 de développer un cancer en fonction de l’obésité, l’hypertension, le sexe, l’âge, une variable médicale sur la consommation d’alcool …. mais qui ne permet pas de mesurer l’alcool caché (de plus l’alcool est un facteur confondant obésité/DT2/CHC)
+
+
+
+##### Qqs infos sur les données
+
+fichier t2d_ready_age_date_full.csv ==> 1 ligne par patient (on utilisera principalement ce jeu de données)
+
+dp_dr : signifie qu'il s'agit de la maladie principale qui est diagnostiquée (c'est très spécifique et peu sensible)
+all : signifie que la maladie est présente, mais ce n'est pas nécessairement le motif principal d'hospitalisation (moins spécifique et sensible)
+anonyme          : clé patient
+age.min        : premier âge enregistré dans la base. Pour rappel on extrait toutes les antériorités et le futur de tous les patients sélectionnés
+codeGeo"          : code géographique on peut les regrouper ? y a t-il une base pour pouvoir regrouper par département ou région ?
+D_hepatocellular_carcinoma_dp_dr : date de diagnostic du cancer
+D_entry : Première date enregistrée                                   
+D_discharge      : date de la dernière hospitalisation
+D_death : date décès
+age.max : dernière fois que le patient a été vu (sorti de l'hopital)
+
+
+
+#### Qq infos données par le médecin sur des pistes d'étude
+
+1. L’alcool contribue au développement de plus de 700 maladies. L'article du Lancet fait le point sur la question et donne toutes les maladies plus ou moins liées à l'alcool. Il faut regarder le supplementary material, avec les risques relatifs https://pubmed.ncbi.nlm.nih.gov/31910980/
+2. L’alcool contribue au développement des maladies du foie, notamment du carcinome hépatocellulaire (CHC)
+3. Les patients avec un diabète de type 2 (DT2) sont à risque de CHC. Le DT2 progresse avec l’épidémie d’obésité. Une hausse du CHC est attendue. La consommation d’alcool progresse. Le nombre de patients avec un trouble d’usage d’alcool (AUD = consommation à risque)
+4. L’alcool est un facteur confondant obésité/DT2/CHC
+5. Le dataset ws_1 comprend toutes les hospitalisations de tous les patients DT2 sur 10 ans. Les diagnostics et les actes  sont enregistrés lors de chaque hospitalisation avec l’âge et la date de sortie
+6. Un objectif pourrait être d’identifier les patients avec un profil ‘AUD-like’ et de mesurer le risque instantané de CHC de ces patients AUD-like, par rapport aux autres
+7. On pourrait mesurer le risque des patients DT2 avec une application ‘shiny’ en entrant des combinaisons de caractéristiques associées à l’alcool (hypertension, obésité, etc...) et l’âge
+8. On a parlé de matrices de transition Alcool => Cirrhose => CHC. Je suis un peu gêné par ce travail parce que ma variable AUD comporte le diagnostic "alcoholic cirrhosis », du coup ma définition est un peu tautologique, il faut que je revois ma définition en jouant avec les dates.
+
+
+
+
+```{r libraries}
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(caret)
+library(groupdata2)
+library(glmnet)
+library(ROSE)
+```
+
+
+Importation du jeu de donnnées
+
+```{r data}
+data_cancer <-fread("t2d.csv", sep = "auto", dec = ",", header = T)
+```
+Ce jeu de données nous fournit 3 955 245 Patients et 325 variables 
+
+Visualisation
+
+```{r}
+table(data_cancer$age_hepatocellular_carcinoma_dp_dr)
+sum(!is.na(data_cancer$age_hepatocellular_carcinoma_dp_dr))
+```
+
+
+<!-- ```{r} -->
+<!-- # Examinez la distribution de l'obésité, de l'hypertension, du sexe, de l'âge et de la consommation d'alcool -->
+
+<!-- variables_to_plot <- c("obesity", "hypertension", "sexe", "age.min", "alcohol_variable") -->
+
+<!-- # Visualisation des distributions -->
+<!-- for (variable in variables_to_plot) { -->
+<!--   ggplot(patients_cancer, aes(x = !!as.symbol(variable))) + -->
+<!--     geom_bar() + -->
+<!--     labs(title = paste("Distribution de", variable)) -->
+<!-- } -->
+<!-- ``` --> 
+
+
+##filtrage et transformation de la base de donnée 
+On ne conserve que les variables "ages" et spécifiques aux maladies (dp_dr)
+On transforme les variables true-false par 0-1
+```{r}
+#filtrage et transformation des bases de données 
+data_cancer_new <- copy(data_cancer)%>%
+  dplyr:: select(-starts_with("D_"), -ends_with("_all"))%>%
+  dplyr:: mutate(across(starts_with("age_"), ~ as.numeric(ifelse(is.na(.), 0, 1))))%>%
+  dplyr:: rename_with(~ sub("age_", "", .x), starts_with("age_"))%>%
+  dplyr:: mutate(across(c("sexe","age.min","codeGeo","age.max"), ~ as.numeric(.)))
+  #dplyr:: select_if(~!all(.==0))#suppression des colonnes où on a que des 0 
+colnames(data_cancer_new)
+str(data_cancer_new)
+
+
+```
+##construire les échantillons nécessaires au lancement des algos 
+après plusieurs tentatives à faire tourner l'algo sur l'ensemble du data_cancer_new, on a décidé de réaliser un échantillonnage en passant à 10 000 individus. 
+
+```{r}
+install.packages("groupdata2")
+library(groupdata2)
+library(glmnet)
+
+
+
+#les variables explicatives doivent être sous forme de matrix 
+data_cancer_new <- data_cancer_new%>%
+  dplyr:: mutate(sexe = ifelse(is.na(sexe), 1, sexe),  # Remplace NA par 1 dans sexe
+         codeGeo = ifelse(is.na(codeGeo), 0, codeGeo)) 
+
+View(data_cancer_new)
+table(data_cancer_new$hepatocellular_carcinoma_treatment_dp_dr)
+#vérifier si nous avons toujours le même nombre de malades 
+sum(data_cancer_new$hepatocellular_carcinoma_dp_dr==1)
+
+###construire les échantillons
+# Nombre total de malades
+nombre_malades <- sum(data_cancer_new$hepatocellular_carcinoma_dp_dr == 1)
+nombre_malades
+
+# Nombre total de non-malades
+nombre_non_malades <- nrow(data_cancer_new) - nombre_malades
+nombre_non_malades
+
+# Proportion de malades dans l'ensemble de données
+prop_malades <- nombre_malades/ nrow(data_cancer_new)
+prop_malades
+
+# Taille de l'échantillon pour les malades
+echantillon_malades <- round(prop_malades * 10000)
+echantillon_malades
+
+# Taille de l'échantillon pour les non-malades
+echantillon_non_malades <- 10000 - echantillon_malades
+echantillon_non_malades
+
+# Échantillonner les malades
+echantillon_malades_data <- data_cancer_new %>%
+  filter(hepatocellular_carcinoma_dp_dr == 1) %>%
+  sample_n(size = echantillon_malades)
+
+# Échantillonner les non-malades
+echantillon_non_malades_data <- data_cancer_new %>%
+  filter(hepatocellular_carcinoma_dp_dr == 0) %>%
+  sample_n(size = echantillon_non_malades)
+
+# Combiner les échantillons de malades et non-malades
+sample_data_cancer <- bind_rows(echantillon_malades_data, echantillon_non_malades_data)
+dim(sample_data_cancer)
+colnames(sample_data_cancer)
+
+#matrix des valeurs prédites 
+cvpred = matrix(0,nrow=nrow(sample_data_cancer),ncol=80)
+
+
+##création des échantillons train et test 
+library(caret)
+
+# reproductibilité
+set.seed(123)
+
+#partition du data 
+trainIndex <- createDataPartition(sample_data_cancer$hepatocellular_carcinoma_dp_dr,p=0.8, list = FALSE, times = 1)
+
+train_data <- sample_data_cancer[trainIndex,]
+head(train_data)
+test_data <- sample_data_cancer[-trainIndex,]
+head(test_data)
+
+#préparer les données 
+x_train <- train_data %>%
+  select(-hepatocellular_carcinoma_dp_dr,-anonyme, -death) %>%
+  as.matrix()
+y_train <- train_data$hepatocellular_carcinoma_dp_dr
+y_train <- factor(y_train)
+
+x_test <- test_data %>%
+  select(-hepatocellular_carcinoma_dp_dr,-anonyme, -death) %>%
+  as.matrix()
+y_test <- test_data$hepatocellular_carcinoma_dp_dr
+y_test <- factor(y_test)
+
+#autre solution pour faire tourner l'algo
+#convertir les matrix en matrix sparse 
+x_train_sparse <- Matrix(x_train, sparse = TRUE)
+x_test_sparse <- Matrix(x_test, sparse = TRUE)
+
+#initialiser le lambda 
+loglambda = seq(-10,10,length=100)
+
+#lancement du modèle de régression logistique pénalisé sur LASSO
+spe_data_cancer_cvlasso = cv.glmnet(x_train_sparse,y_train,family="multinomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+
+#quel est le meilleur lambda 
+plot(spe_data_cancer_cvlasso)
+
+best_lambda <- spe_data_cancer_cvlasso$lambda.min
+
+# Ajustement du modèle final sur l'ensemble d'entraînement sans utiliser le best lambda 
+model_lasso <- glmnet(x_train_sparse, y_train, family = "multinomial", alpha = 1,maxit = 10000)
+
+### Assessment of the model obtained with optimal lambda
+
+proba = predict(model_lasso,newx=x_test_sparse,
+                type="response")[,,which.min(spe_data_cancer_cvlasso$cvm)]
+head(proba) 
+
+predictions = predict(model_lasso,newx=x_test_sparse,
+                type="class")[,which.min(spe_data_cancer_cvlasso$cvm)]
+head(predictions)   # For each coffee, predicted class using Bayes rule
+
+#évaluation de la performance de prediction 
+confusion <- table(y_test,predictions)
+
+accuracy <- sum(diag(confusion)) / sum(confusion)
+
+accuracy
+
+#quels sont les coefficients nuls 
+coefficients <- coef(model_lasso, s = best_lambda)
+print(coefficients)
+
+
+
+### Accuracy of the Lasso regression model
+
+
+class(y_train)
+levels(y_train)
+table(y_train)
+sum(is.na(x_train))
+sum(is.infinite(x_train)) 
+
+nrow(x_train)
+dim(x_train)
+
+
+#problème, on réajuste avec la valeur plus parcimonieuse de lambda
+best_lambda <- spe_data_cancer_cvlasso$lambda.1se
+# Ajustement du modèle final sur l'ensemble d'entraînement
+model_lasso <- glmnet(x_train, y_train, family = "multinomial", lambda = best_lambda)
+
+#toujours le même problème de convergence, on va augmenter le maxit 
+model_lasso <- glmnet(x_train, y_train, alpha = 1,family = "multinomial",lambda = -5.8,maxit = 500000)
+
+#toujours le même problème 
+cor(x_train)
+summary(y_train)
+
+#relancer l'algo sans le choix du lambda 
+model_lasso <- glmnet(x_train_sparse, y_train, alpha = 1,family = "multinomial",  lambda=exp(loglambda) ,maxit = 10000)
+
+
+plot(model_lasso)
+
+#prediction 
+predictions <- predict(model_lasso, newx = X_test, s = best_lambda, type = "class")
+
+```
+Dans ce modèle nous avons choisi la régression logistique pénalisée par LASSO dans l'espoir d'identifier les variables significatives. 
+Après plusieurs tentatives, il semble que la sélection du bestlambda dans le lancement de l'algo le fasse planter. 
+On a donc décidé de ne pas sélectionner le bestlambda et de laisser l'algo faire une sélection automatique. 
+Nous obtenons une accuracy de 99% ce qui laisse quelques doutes quant à la qualité de prédiction de l'algo. 
+On pense que c'est principalement lié à la nature des variables elles mêmes, puisque nous sommes confrontés à des classes trés déséquilibrées par exemple pour un échantillon de 8000 ind (x_train) nous avons seulement 70 malades. 
+l'algo a sélectionné 29 variables explicatives. 
+
+il est judicieux maintenant d'augmenter la taille de l'échantillon à 300000 
+
+##Augmentation de la taille de l'échantillon et stratification par le sexe 
+on augmente la taille de l'échantillon à 300000 individus pour augmenter la force de notre analyse statistique 
+
+on décide de stratifié par le sexe car dans la majorité des études c'est considéré comme facteur confondant 
+Il est bien documenté que l'incidence et les facteurs de risque du cancer hépatocellulaire peuvent varier significativement entre les hommes et les femmes. Par exemple, les hommes sont généralement plus susceptibles que les femmes de développer ce type de cancer, ce qui peut être lié à des différences dans les facteurs de risque tels que la consommation d'alcool, les infections virales chroniques, et certaines conditions métaboliques.
+
+```{r}
+##même code que précedemment##
+#les variables explicatives doivent être sous forme de matrix 
+data_cancer_new <- data_cancer_new%>%
+  dplyr:: mutate(sexe = ifelse(is.na(sexe), 1, sexe),  # Remplace NA par 1 dans sexe
+         codeGeo = ifelse(is.na(codeGeo), 0, codeGeo)) 
+
+View(data_cancer_new)
+table(data_cancer_new$hepatocellular_carcinoma_treatment_dp_dr)
+#vérifier si nous avons toujours le même nombre de malades 
+sum(data_cancer_new$hepatocellular_carcinoma_dp_dr==1)
+
+###construire les échantillons
+# Nombre total de malades
+nombre_malades <- sum(data_cancer_new$hepatocellular_carcinoma_dp_dr == 1)
+nombre_malades
+
+# Nombre total de non-malades
+nombre_non_malades <- nrow(data_cancer_new) - nombre_malades
+nombre_non_malades
+
+# Proportion de malades dans l'ensemble de données
+prop_malades <- nombre_malades/ nrow(data_cancer_new)
+prop_malades
+
+# Taille de l'échantillon pour les malades
+echantillon_malades <- round(prop_malades * 300000)
+echantillon_malades
+
+# Taille de l'échantillon pour les non-malades
+echantillon_non_malades <- 300000 - echantillon_malades
+echantillon_non_malades
+
+# Échantillonner les malades
+echantillon_malades_data <- data_cancer_new %>%
+  filter(hepatocellular_carcinoma_dp_dr == 1) %>%
+  sample_n(size = echantillon_malades)
+
+# Échantillonner les non-malades
+echantillon_non_malades_data <- data_cancer_new %>%
+  filter(hepatocellular_carcinoma_dp_dr == 0) %>%
+  sample_n(size = echantillon_non_malades)
+
+# Combiner les échantillons de malades et non-malades
+sample_data_cancer <- bind_rows(echantillon_malades_data, echantillon_non_malades_data)
+dim(sample_data_cancer)
+
+#stratification par le sexe 
+sample_data_cancer <- sample_data_cancer %>%
+  group_by(sexe) %>%
+  sample_frac(size = 1) %>%
+  ungroup()
+
+
+##création des échantillons train et test 
+library(caret)
+
+# reproductibilité
+set.seed(123)
+
+#partition du data 
+trainIndex <- createDataPartition(sample_data_cancer$hepatocellular_carcinoma_dp_dr,p=0.8, list = FALSE, times = 1)
+
+train_data <- sample_data_cancer[trainIndex,]
+head(train_data)
+test_data <- sample_data_cancer[-trainIndex,]
+head(test_data)
+
+#préparer les données 
+x_train <- train_data %>%
+  select(-hepatocellular_carcinoma_dp_dr,-anonyme, -death) %>%
+  as.matrix()
+y_train <- train_data$hepatocellular_carcinoma_dp_dr
+y_train <- factor(y_train)
+
+x_test <- test_data %>%
+  select(-hepatocellular_carcinoma_dp_dr,-anonyme, -death) %>%
+  as.matrix()
+y_test <- test_data$hepatocellular_carcinoma_dp_dr
+y_test <- factor(y_test)
+
+
+##convertir les matrix en matrix sparse 
+x_train_sparse <- Matrix(x_train, sparse = TRUE)
+x_test_sparse <- Matrix(x_test, sparse = TRUE)
+
+#initialiser le lambda 
+loglambda = seq(-10,10,length=100)
+
+#lancement du modèle de régression logistique pénalisé sur LASSO
+spe_data_cancer_cvlasso = cv.glmnet(x_train_sparse,y_train,family="multinomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+summary(spe_data_cancer_cvlasso)
+
+
+#quel est le meilleur lambda plot(spe_data_cancer_cvlasso)
+
+best_lambda <- spe_data_cancer_cvlasso$lambda.min 
+
+#plot 
+plot(spe_data_cancer_cvlasso)
+
+# Ajustement du modèle final sur l'ensemble d'entraînement sans utiliser le best lambda 
+model_lasso <- glmnet(x_train_sparse, y_train, family = "multinomial", alpha = 1,maxit = 10000)
+
+### model obtained with optimal lambda
+
+proba = predict(model_lasso, newx=x_test_sparse, type="response", s=spe_data_cancer_cvlasso$lambda.min)
+
+
+predictions = predict(model_lasso,newx=x_test_sparse,
+                type="class",s=spe_data_cancer_cvlasso$lambda.min)
+
+head(predictions)   
+
+####évaluation de la performance de prediction 
+
+#utilisation de confusionmatrix
+predictions <- factor(predictions)#convertir en facteur pour appliquer confusionmatrix
+confusionMatrix(predictions,y_test,mode = "everything",positive = "1")
+
+#quels sont les variables sélectionnées 
+coefficient <- coef(spe_data_cancer_cvlasso, s=spe_data_cancer_cvlasso$lambda.min)
+coefficient
+
+
+
+```
+
+Accuracy (Exactitude) : le modèle a une exactitude de 99.7%, ce qui est exceptionnellement élevé. 
+Sensitivity (Sensibilité) et Specificity (Spécificité) : La sensibilité (vrais positifs) est de 84.4%, tandis que la spécificité (vrais négatifs) est de 99.8%. Le modèle est très bon pour identifier les non-malades (spécificité élevée), mais un peu moins performant pour détecter tous les cas de maladie (sensibilité).
+Positive Predictive Value (Valeur Prédictive Positive) et Negative Predictive Value (Valeur Prédictive Négative) : La valeur prédictive positive de 80.9% et la valeur prédictive négative de 99.9% indiquent que lorsqu'un individu est prédit comme malade, il y a 80.9% de chances qu'il le soit réellement, et lorsqu'un individu est prédit comme non-malade, il y a 99.9% de chances qu'il ne le soit pas.
+Precision, Recall, et F1 Score : Ces mesures sont cohérentes avec les valeurs prédictives et la sensibilité. Un score F1 de 82.6% est assez élevé, indiquant un bon équilibre entre précision et rappel. 
+Mais la faible prévalence de la maladie et le déséquilibre potentiel des classes pourraient affecter ces résultats
+
+Analyse des coefficients : 
+
+Variables avec Coefficient Nul :
+codeGeo
+acute_kidney_injury_dp_dr
+aids_dp_dr
+alcohol_use_disorders_dp_dr
+budd_chiari_syndrome_dp_dr
+chronic_obstructive_pulmonary_disase_dp_dr
+congestive_heart_failure_dp_dr
+dementia_dp_dr
+diabetes_mellitus_uncomplicated_dp_dr
+diabetes_mellitus_dp_dr
+chronic_hepatitis_C_dp_dr
+chronic_hepatitis_D_dp_dr
+hepatopulmonary_syndrome_dp_dr
+hydrothorax_dp_dr
+hyperlipemia_mixed_dp_dr
+hypertension_dp_dr
+liver_disease_mild_dp_dr
+obesity_dp_dr
+splanchnic_thrombophlebitis_dp_dr
+thrombophlebitis_migrans_dp_dr
+age.max
+
+Variables avec les Coefficients Non Nuls les Plus Élevés :
+solid_tumor_localised_without_liver_dp_dr                       3.0677536017
+intrahepatic_bile_duct_carcinoma_dp_dr                          1.2283422368
+jaundice_dp_dr                                                  0.6562243169
+other_primary_liver_cancer_dp_dr                                0.5911156041
+sexe                                                            0.4969341568
+cholangitis_dp_dr                                               0.3742065060
+hepatorenal_syndrome_dp_dr                                      0.3430114840
+connective_tissue_disorder_dp_dr                                0.2815795130
+embolism_and_thrombosis_of_renal_vein_dp_dr                     0.2524765470
+alcoholic_cirrhosis_dp_dr                                       0.1724662511
+alcohol_use_disorders_without_K70_dp_dr                         0.1649663089
+alcoholic_liver_disease_dp_dr                                   0.1122845498
+
+solid_tumor_localised_dp_dr                                    -5.9925475832
+liver_transplantation_dp_dr                                    -1.1917160988
+cirrhosis_dp_dr                                                -0.7732592640
+embolism_and_thrombosis_of_vena_cava_dp_dr                     -0.6429748044
+alcohol_rehabilitation_dp_dr                                   -0.5853916992
+portal_vein_thrombosis_dp_dr                                   -0.4449668342
+autoimmune_hepatitis_dp_dr                                     -0.4325960185
+portal_hypertension_dp_dr                                      -0.4054199899
+hypertensive_heart_failure_with_or_without_renal_failure_dp_dr -0.3517129929
+lymphoma_dp_dr                                                 -0.3025763019
+hypercholesterolemia_pure_dp_dr                                -0.2668078601
+chronic_hepatitis_B_dp_dr                                      -0.2617014407
+
+le modèle exclu certaines variables cliniquement pertinentes (hépatites C, alcool use disorder, liver disease), et 
+
+certaines variables ont des directions opposées aux "consensus" clinique (solid tumor localised,cirrhosis, autoimmnune hepatitis, chronic hepatitis B) 
+
+une piste de réflexion c'est qu'elles seraient fortement corrélées avec d'autres variables incluses dans le modèle. Si certaines variables sont fortement corrélées entre elles, LASSO pourrait retenir seulement quelques-unes de ces variables corrélées, car ensemble, elles n'apportent pas beaucoup d'informations supplémentaires au modèle.
+
+
+##identification des corrélation entre les variables 
+```{r}
+library(corrplot)
+library(ggplot2)
+
+# Calcul de la matrice de corrélation
+var_inclu <- x_train[, !(colnames(x_train) %in% c("sexe", "age.min", "codeGeo", "age.max", "death"))]
+cor_matrix <- cor(var_inclu, method = "pearson", use = "complete.obs")
+
+quartz(width = 10, height = 8)
+corrplot(cor_matrix, method = "circle", order = "hclust",tl.cex = 0.5, tl.col = "black", tl.srt = 45)
+
+
+```
+On observe une zone où il existe une forte corrélation entre plusieurs variables, sans surprise, cela correspond aux variables liées par une origine plus ou moins commune (cirhose, cirhose alcoolique, trouble de l'alcool, etc)
+Nous réalisons ci-dessous un zoom de notre matrice de correlation concentrée sur les variables d'intérêt clinique
+```{r}
+# Sélectionner uniquement les variables pertinentes 
+selected_data <- sample_data_cancer[, c('sexe', 'solid_tumor_localised_without_liver_dp_dr', 'alcoholic_cirrhosis_dp_dr', 'alcoholic_liver_disease_dp_dr', 'acute_kidney_injury_dp_dr', 'alcohol_rehabilitation_dp_dr', 'solid_tumor_localised_dp_dr', 'alcohol_use_disorders_dp_dr', 'alcohol_use_disorders_without_K70_dp_dr', 'cirrhosis_dp_dr', 'chronic_hepatitis_B_dp_dr', 'chronic_hepatitis_C_dp_dr', 'hypertension_dp_dr', 'liver_disease_mild_dp_dr', 'liver_disease_moderate_to_severe_dp_dr', 'liver_transplantation_dp_dr', 'obesity_dp_dr', 'solid_tumor_metastatic_dp_dr',"codeGeo","decompensated_cirrhosis_dp_dr","liver_transplantation_dp_dr","other_primary_liver_cancer_dp_dr","palliative_care_dp_dr","hepatocellular_carcinoma_dp_dr","other_cause_of_chronic_liver_disease_dp_dr","chemotherapy_for_cancer_dp_dr","chemotherapy_for_connective_tissue_disorder_dp_dr")]
+
+# Calculer la matrice de corrélation
+cor_matrix <- cor(selected_data, method = "pearson" ,use = "complete.obs")
+
+# Afficher la matrice de corrélation
+quartz(width = 10, height = 8)
+corrplot(cor_matrix, method = "circle", order = "hclust",tl.cex = 0.5, tl.col = "black", tl.srt = 45)
+
+```
+il y a des variables fortements correllées
+
+nous allons utiliser une regression log pénalisée par elastic net qui peut gérer efficacement cette corrélation, contrairement au Lasso qui pourrait sélectionner de manière arbitraire parmi les variables corrélées. 
+
+```{r}
+#refaire la matrice de corrélation pour voir quelle variable est la plus correllée avec la variable réponse 
+selected_data <- data_cancer_new[, c('sexe', 'solid_tumor_localised_without_liver_dp_dr', 'alcoholic_cirrhosis_dp_dr', 'alcoholic_liver_disease_dp_dr', 'acute_kidney_injury_dp_dr', 'alcohol_rehabilitation_dp_dr', 'solid_tumor_localised_dp_dr', 'alcohol_use_disorders_dp_dr', 'alcohol_use_disorders_without_K70_dp_dr', 'cirrhosis_dp_dr', 'chronic_hepatitis_B_dp_dr', 'chronic_hepatitis_C_dp_dr', 'hypertension_dp_dr', 'liver_disease_mild_dp_dr', 'liver_disease_moderate_to_severe_dp_dr', 'liver_transplantation_dp_dr', 'obesity_dp_dr', 'solid_tumor_metastatic_dp_dr',"codeGeo","decompensated_cirrhosis_dp_dr","liver_disease_mild_dp_dr","liver_transplantation_dp_dr","other_cause_of_chronic_liver_disease_dp_dr","other_primary_liver_cancer_dp_dr","palliative_care_dp_dr","hepatocellular_carcinoma_dp_dr","other_cause_of_chronic_liver_disease_dp_dr","chemotherapy_for_cancer_dp_dr","chemotherapy_for_connective_tissue_disorder_dp_dr")]
+
+colnames(data_cancer_new)
+
+# Calculer la matrice de corrélation
+cor_matrix <- cor(selected_data, method = "pearson" ,use = "complete.obs")
+
+# Afficher la matrice de corrélation
+quartz(width = 10, height = 8)
+corrplot(cor_matrix, method = "circle", order = "hclust",tl.cex = 0.5, tl.col = "black", tl.srt = 45)
+
+```
+## appliquer LASSO en enlevant des variables comme cancer etc 
+```{r}
+library(dplyr)
+library(groupdata2)
+library(glmnet)
+
+#######enlever les variables liées au cancer 
+data_cancer_new2 <- copy(data_cancer)%>%
+  dplyr:: select(-starts_with("D_"), -ends_with("_all"))
+colnames(data_cancer_new2)
+
+variable_remove <- c("anonyme",
+                     "age_chemotherapy_for_cancer_dp_dr","age_chemotherapy_for_connective_tissue_disorder_dp_dr",
+                    "age_solid_tumor_localised_dp_dr","age_solid_tumor_metastatic_dp_dr","age_liver_biopsy_dp_dr",
+                    "age_hepatocellular_carcinoma_treatment_dp_dr","age_palliative_care_dp_dr")
+ 
+data_cancer_new2 <- data_cancer_new2%>%
+  dplyr:: select(-all_of(variable_remove))%>%
+  dplyr:: mutate(across(starts_with("age_"), ~ as.numeric(ifelse(is.na(.), 0, 1))))%>%
+  dplyr:: rename_with(~ sub("age_", "", .x), starts_with("age_"))%>%
+  dplyr:: mutate(across(c("sexe","age.min","codeGeo","age.max"), ~ as.numeric(.)))
+  #dplyr:: select_if(~!all(.==0))#suppression des colonnes où on a que des 0 
+
+##même code que précedemment##
+#les variables explicatives doivent être sous forme de matrix 
+data_cancer_new2 <- data_cancer_new2%>%
+  dplyr:: select(-death)%>%
+  dplyr:: mutate(sexe = ifelse(is.na(sexe), 1, sexe),  # Remplace NA par 1 dans sexe
+         codeGeo = ifelse(is.na(codeGeo), 0, codeGeo)) 
+
+colnames(data_cancer_new2)
+View(data_cancer_new)
+table(data_cancer_new$hepatocellular_carcinoma_treatment_dp_dr)
+#vérifier si nous avons toujours le même nombre de malades 
+sum(data_cancer_new$hepatocellular_carcinoma_dp_dr==1)
+
+###construire les échantillons
+# Nombre total de malades
+nombre_malades <- sum(data_cancer_new2$hepatocellular_carcinoma_dp_dr == 1)
+nombre_malades
+
+# Nombre total de non-malades
+nombre_non_malades <- nrow(data_cancer_new2) - nombre_malades
+nombre_non_malades
+
+# Proportion de malades dans l'ensemble de données
+prop_malades <- nombre_malades/ nrow(data_cancer_new2)
+prop_malades
+
+# Taille de l'échantillon pour les malades
+echantillon_malades <- round(prop_malades * 300000)
+echantillon_malades
+
+# Taille de l'échantillon pour les non-malades
+echantillon_non_malades <- 300000 - echantillon_malades
+echantillon_non_malades
+
+# Échantillonner les malades
+echantillon_malades_data <- data_cancer_new2 %>%
+  filter(hepatocellular_carcinoma_dp_dr == 1) %>%
+  sample_n(size = echantillon_malades)
+
+# Échantillonner les non-malades
+echantillon_non_malades_data <- data_cancer_new2 %>%
+  filter(hepatocellular_carcinoma_dp_dr == 0) %>%
+  sample_n(size = echantillon_non_malades)
+
+# Combiner les échantillons de malades et non-malades
+sample_data_cancer <- bind_rows(echantillon_malades_data, echantillon_non_malades_data)
+dim(sample_data_cancer)
+
+#stratification par le sexe 
+sample_data_cancer <- sample_data_cancer %>%
+  group_by(sexe) %>%
+  sample_frac(size = 1) %>%
+  ungroup()
+
+sum(is.na(sample_data_cancer))
+sapply(sample_data_cancer, function(x) sum(is.na(x)))
+##création des échantillons train et test 
+library(caret)
+
+# reproductibilité
+set.seed(123)
+
+#partition du data 
+trainIndex <- createDataPartition(sample_data_cancer$hepatocellular_carcinoma_dp_dr,p=0.8, list = FALSE, times = 1)
+
+train_data <- sample_data_cancer[trainIndex,]
+head(train_data)
+test_data <- sample_data_cancer[-trainIndex,]
+head(test_data)
+
+#préparer les données 
+x_train <- train_data %>%
+  select(-hepatocellular_carcinoma_dp_dr) %>%
+  as.matrix()
+y_train <- train_data$hepatocellular_carcinoma_dp_dr
+y_train <- factor(y_train)
+
+x_test <- test_data %>%
+  select(-hepatocellular_carcinoma_dp_dr) %>%
+  as.matrix()
+y_test <- test_data$hepatocellular_carcinoma_dp_dr
+y_test <- factor(y_test)
+
+
+##convertir les matrix en matrix sparse 
+x_train_sparse <- Matrix(x_train, sparse = TRUE)
+x_test_sparse <- Matrix(x_test, sparse = TRUE)
+
+#initialiser le lambda 
+loglambda = seq(-10,10,length=100)
+
+#lancement du modèle de régression logistique pénalisé sur LASSO
+spe_data_cancer_cvlasso = cv.glmnet(x_train_sparse,y_train,family="multinomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+summary(spe_data_cancer_cvlasso)
+
+
+#quel est le meilleur lambda plot(spe_data_cancer_cvlasso)
+
+best_lambda <- spe_data_cancer_cvlasso$lambda.min 
+
+#plot 
+plot(spe_data_cancer_cvlasso)
+
+# Ajustement du modèle final sur l'ensemble d'entraînement sans utiliser le best lambda 
+model_lasso <- glmnet(x_train_sparse, y_train, family = "multinomial", alpha = 1,maxit = 10000)
+
+
+### model obtained with optimal lambda
+
+proba = predict(model_lasso, newx=x_test_sparse, type="response", s=spe_data_cancer_cvlasso$lambda.min)
+
+
+predictions = predict(model_lasso,newx=x_test_sparse,
+                type="class",s=spe_data_cancer_cvlasso$lambda.min)
+
+head(predictions)   
+
+####évaluation de la performance de prediction 
+
+#utilisation de confusionmatrix
+predictions <- factor(predictions)#convertir en facteur pour appliquer confusionmatrix
+confusionMatrix(predictions,y_test,mode = "everything",positive = "1")
+
+#quels sont les variables sélectionnées 
+coefficient <- coef(spe_data_cancer_cvlasso, s=spe_data_cancer_cvlasso$lambda.min)
+coefficient
+```
+##tourner la regression avec recodification des variables en prenant en compte l'antériorité 
+
+```{r}
+#création d'une fonction 
+# Elle utilise la valeur de D_hepatocellular_carcinoma_dp_dr dans la ligne pour la comparer aux autres variables maladie 
+fonction_colonne <- function(colonne, date_reference) {
+  ifelse(!is.na(colonne) & !is.na(date_reference) & colonne < date_reference, 1, 0)
+}
+
+
+data_cancer_new3 <- copy(data_cancer) %>%
+  dplyr::select(-starts_with("age_"), -ends_with("_all"))
+
+variable_remove <- c("anonyme",
+                     "D_chemotherapy_for_cancer_dp_dr","D_chemotherapy_for_connective_tissue_disorder_dp_dr",
+                    "D_solid_tumor_localised_dp_dr","D_solid_tumor_localised_without_liver_dp_dr",
+                    "D_solid_tumor_metastatic_dp_dr","D_liver_biopsy_dp_dr",
+                    "D_hepatocellular_carcinoma_treatment_dp_dr","D_palliative_care_dp_dr","age.min","age.max",
+                    "death",
+                    "D_death")
+
+data_cancer_new3 <- data_cancer_new3%>%
+  dplyr::select(-all_of(variable_remove))%>%
+  dplyr::mutate(
+    across(c("sexe", "codeGeo"), as.numeric),
+    codeGeo = ifelse(is.na(codeGeo), 0, codeGeo),
+    sexe = ifelse(is.na(sexe), 1, sexe),
+    across(setdiff(names(.)[starts_with("D_")], "D_hepatocellular_carcinoma_dp_dr"), 
+           ~ fonction_colonne(., D_hepatocellular_carcinoma_dp_dr)),
+    across(starts_with("D_"), ~ ifelse(is.na(.), 0, .))
+  ) %>%
+  #dplyr::mutate(D_hepatocellular_carcinoma_dp_dr = ifelse(!is.na(D_hepatocellular_carcinoma_dp_dr),1,0))
+  dplyr::mutate(across(-codeGeo, as.factor))
+  #dplyr::select(-D_death)
+
+
+data_cancer_new3 <- data_cancer_new3%>%
+  dplyr:: mutate(D_hepatocellular_carcinoma_dp_dr = as.numeric(as.character(D_hepatocellular_carcinoma_dp_dr)),
+         D_hepatocellular_carcinoma_dp_dr = ifelse(D_hepatocellular_carcinoma_dp_dr > 0, 1, 0))
+
+
+##même code que précedemment##
+#les variables explicatives doivent être sous forme de matrix 
+data_cancer_new3 <- data_cancer_new3%>%
+  dplyr:: mutate(sexe = ifelse(is.na(sexe), 1, sexe),  # Remplace NA par 1 dans sexe
+         codeGeo = ifelse(is.na(codeGeo), 0, codeGeo)) 
+
+# Identification des colonnes qui ne contiennent que des zéros
+zero_cols <- names(data_cancer_new3)[colSums(data_cancer_new3 != 0) == 0]
+zero_cols
+data_cancer_new3 <- data_cancer_new3 %>%
+  select(-all_of(zero_cols))
+
+colnames(data_cancer_new3)
+
+table(data_cancer_new3$D_hepatocellular_carcinoma_dp_dr)
+
+#vérifier si nous avons toujours le même nombre de malades 
+sum(data_cancer_new3$D_hepatocellular_carcinoma_dp_dr==1)
+
+###construire les échantillons
+# Nombre total de malades
+nombre_malades <- sum(data_cancer_new3$D_hepatocellular_carcinoma_dp_dr == 1)
+nombre_malades
+
+# Nombre total de non-malades
+nombre_non_malades <- nrow(data_cancer_new3) - nombre_malades
+nombre_non_malades
+
+# Proportion de malades dans l'ensemble de données
+prop_malades <- nombre_malades/ nrow(data_cancer_new3)
+prop_malades
+
+# Taille de l'échantillon pour les malades
+echantillon_malades <- round(prop_malades * 300000)
+echantillon_malades
+
+# Taille de l'échantillon pour les non-malades
+echantillon_non_malades <- 300000 - echantillon_malades
+echantillon_non_malades
+
+# Échantillonner les malades
+echantillon_malades_data <- data_cancer_new3 %>%
+  filter(D_hepatocellular_carcinoma_dp_dr == 1) %>%
+  sample_n(size = echantillon_malades)
+
+# Échantillonner les non-malades
+echantillon_non_malades_data <- data_cancer_new3 %>%
+  filter(D_hepatocellular_carcinoma_dp_dr == 0) %>%
+  sample_n(size = echantillon_non_malades)
+
+# Combiner les échantillons de malades et non-malades
+sample_data_cancer <- bind_rows(echantillon_malades_data, echantillon_non_malades_data)
+dim(sample_data_cancer)
+
+#mélanger 
+set.seed(123)
+sample_data_cancer <- sample_data_cancer%>%
+  sample_frac(size = 1) 
+
+
+#stratification par le sexe 
+sample_data_cancer <- sample_data_cancer %>%
+  group_by(sexe) %>%
+  sample_frac(size = 1) %>%
+  ungroup()
+
+
+##création des échantillons train et test 
+library(caret)
+library(groupdata2)
+library(glmnet)
+install.packages("ROCR")
+install.packages("/Users/PC2/Downloads/DMwR_0.4.1.tar", repos = NULL, type = "source")
+install.packages("ROSE")
+library(ROSE)
+# reproductibilité
+set.seed(123)
+
+table(sample_data_cancer$D_hepatocellular_carcinoma_dp_dr)
+print(unique(sample_data_cancer[,3:76]))
+
+#partition du data 
+trainIndex <- createDataPartition(sample_data_cancer$D_hepatocellular_carcinoma_dp_dr,p=0.8, list = FALSE, times = 1)
+
+train_data <- sample_data_cancer[trainIndex,]
+
+test_data <- sample_data_cancer[-trainIndex,]
+
+
+train_data$D_hepatocellular_carcinoma_dp_dr <- as.factor(train_data$D_hepatocellular_carcinoma_dp_dr)
+train_data$sexe <- as.factor(train_data$sexe)
+train_data$codeGeo <- as.factor(train_data$codeGeo)
+
+str(train_data)
+
+#sur-échantillonnage 
+
+# Appliquer ROSE pour le suréchantillonnage
+result <- ROSE(D_hepatocellular_carcinoma_dp_dr ~ ., data = train_data, p=0.1 ,N = 240000)$data
+str(result)
+
+
+
+#préparer les données 
+x_train <- result %>%
+  select(-D_hepatocellular_carcinoma_dp_dr) %>%
+  as.matrix()
+y_train <- result$D_hepatocellular_carcinoma_dp_dr
+y_train <- factor(y_train)
+
+x_test <- test_data %>%
+  select(-D_hepatocellular_carcinoma_dp_dr) %>%
+  as.matrix()
+y_test <- test_data$D_hepatocellular_carcinoma_dp_dr
+y_test <- factor(y_test)
+
+library(Matrix)
+##convertir les matrix en matrix sparse 
+x_train_sparse <- Matrix(x_train, sparse = TRUE)
+x_test_sparse <- Matrix(x_test, sparse = TRUE)
+str(x_train)
+sum(is.na(x_train))
+summary(x_train)
+dim(x_train)
+length(y_train)
+str(x_train)
+x_train_scaled <- scale(x_train)
+
+sum(is.na(x_train))
+sum(is.na(y_train))
+str(x_train_scaled)
+
+zero_sd_cols <- sapply(x_train, function(x) sd(x) == 0)
+names(x_train)[zero_sd_cols]
+
+sum(is.infinite(x_train))
+table(result$D_hepatocellular_carcinoma_dp_dr)
+
+
+#initialiser le lambda 
+loglambda = seq(-10,10,length=100)
+
+#lancement du modèle de régression logistique pénalisé sur LASSO
+spe_data_cancer_cvlasso = cv.glmnet(x_train,y_train,family="binomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+summary(spe_data_cancer_cvlasso)
+
+
+#quel est le meilleur lambda plot(spe_data_cancer_cvlasso)
+
+best_lambda <- spe_data_cancer_cvlasso$lambda.min
+
+#plot 
+plot(spe_data_cancer_cvlasso)
+
+# Ajustement du modèle final sur l'ensemble d'entraînement sans utiliser le best lambda 
+model_lasso <- glmnet(x_train, y_train, family = "binomial", lambda = best_lambda, alpha = 1,maxit = 10000)
+
+
+### model obtained with optimal lambda
+
+proba = predict(model_lasso, newx=x_test, type="response", s=best_lambda)
+
+
+predictions = predict(model_lasso,newx=x_test,
+                type="class",s=spe_data_cancer_cvlasso$lambda.min)
+
+head(predictions)   
+
+####évaluation de la performance de prediction 
+
+#utilisation de confusionmatrix
+predictions <- factor(predictions)#convertir en facteur pour appliquer confusionmatrix
+confusionMatrix(predictions,y_test,mode = "everything",positive = "1")
+
+#quels sont les variables sélectionnées 
+coefficient <- coef(spe_data_cancer_cvlasso, s=spe_data_cancer_cvlasso$lambda.min)
+coefficient
+```
+##regression logistique en prenant en compte l'antériorité et avec uniquement les variables pertinentes 
+```{r}
+#création d'une fonction 
+# Elle utilise la valeur de D_hepatocellular_carcinoma_dp_dr dans la ligne pour la comparer aux autres variables maladie 
+fonction_colonne <- function(colonne, date_reference) {
+  ifelse(!is.na(colonne) & !is.na(date_reference) & colonne < date_reference, 1, 0)
+}
+
+
+data_cancer_new3 <- copy(data_cancer) %>%
+  dplyr::select(-starts_with("age_"), -ends_with("_all"))
+
+variable_remove <- c("anonyme",
+                     "D_chemotherapy_for_cancer_dp_dr","D_chemotherapy_for_connective_tissue_disorder_dp_dr",
+                    "D_solid_tumor_localised_dp_dr","D_solid_tumor_localised_without_liver_dp_dr",
+                    "D_solid_tumor_metastatic_dp_dr",
+                    "D_hepatocellular_carcinoma_treatment_dp_dr","D_palliative_care_dp_dr","age.min","age.max",
+                    "death","D_death")
+                    
+
+data_cancer_new3 <- data_cancer_new3%>%
+  dplyr::select(-all_of(variable_remove))%>%
+  dplyr::mutate(
+    across(c("sexe", "codeGeo"), as.numeric),
+    codeGeo = ifelse(is.na(codeGeo), 0, codeGeo),
+    sexe = ifelse(is.na(sexe), 1, sexe),
+    across(setdiff(names(.)[starts_with("D_")], "D_hepatocellular_carcinoma_dp_dr"), 
+           ~ fonction_colonne(., D_hepatocellular_carcinoma_dp_dr)),
+    across(starts_with("D_"), ~ ifelse(is.na(.), 0, .))
+  ) %>%
+  #dplyr::mutate(D_hepatocellular_carcinoma_dp_dr = ifelse(!is.na(D_hepatocellular_carcinoma_dp_dr),1,0))
+  dplyr::mutate(across(-codeGeo, as.factor))
+
+
+data_cancer_new3 <- data_cancer_new3%>%
+  dplyr:: mutate(D_hepatocellular_carcinoma_dp_dr = as.numeric(as.character(D_hepatocellular_carcinoma_dp_dr)),
+         D_hepatocellular_carcinoma_dp_dr = ifelse(D_hepatocellular_carcinoma_dp_dr > 0, 1, 0))
+
+
+##même code que précedemment##
+
+data_cancer_new3 <- data_cancer_new3%>%
+  dplyr:: mutate(sexe = ifelse(is.na(sexe), 1, sexe),  # Remplace NA par 1 dans sexe
+         codeGeo = ifelse(is.na(codeGeo), 0, codeGeo)) 
+
+# Identification des colonnes qui ne contiennent que des zéros
+zero_cols <- names(data_cancer_new3)[colSums(data_cancer_new3 != 0) == 0]
+zero_cols
+data_cancer_new3 <- data_cancer_new3 %>%
+  select(-all_of(zero_cols))
+
+colnames(data_cancer_new3)
+
+table(data_cancer_new3$D_hepatocellular_carcinoma_dp_dr)
+
+#vérifier si nous avons toujours le même nombre de malades 
+sum(data_cancer_new3$D_hepatocellular_carcinoma_dp_dr==1)
+
+###construire les échantillons
+# Nombre total de malades
+nombre_malades <- sum(data_cancer_new3$D_hepatocellular_carcinoma_dp_dr == 1)
+nombre_malades
+
+# Nombre total de non-malades
+nombre_non_malades <- nrow(data_cancer_new3) - nombre_malades
+nombre_non_malades
+
+# Proportion de malades dans l'ensemble de données
+#prop_malades <- nombre_malades/ nrow(data_cancer_new3)
+#prop_malades
+
+# Taille de l'échantillon pour les malades
+#echantillon_malades <- round(prop_malades * 300000)
+#echantillon_malades
+
+# Taille de l'échantillon pour les non-malades
+echantillon_non_malades <- 300000 - nombre_malades
+echantillon_non_malades
+
+
+# Échantillonner les malades
+echantillon_malades_data <- data_cancer_new3 %>%
+  filter(D_hepatocellular_carcinoma_dp_dr == 1) %>%
+  sample_n(size = nombre_malades)
+
+# Échantillonner les non-malades
+echantillon_non_malades_data <- data_cancer_new3 %>%
+  filter(D_hepatocellular_carcinoma_dp_dr == 0) %>%
+  sample_n(size = echantillon_non_malades)
+
+# Combiner les échantillons de malades et non-malades
+sample_data_cancer <- bind_rows(echantillon_malades_data, echantillon_non_malades_data)
+dim(sample_data_cancer)
+
+#mélanger 
+set.seed(123)
+sample_data_cancer <- sample_data_cancer%>%
+  sample_frac(size = 1) 
+
+
+#stratification par le sexe 
+sample_data_cancer <- sample_data_cancer %>%
+  group_by(sexe) %>%
+  sample_frac(size = 1) %>%
+  ungroup()
+
+#partition du data 
+trainIndex <- createDataPartition(sample_data_cancer$D_hepatocellular_carcinoma_dp_dr,p=0.8, list = FALSE, times = 1)
+
+train <- sample_data_cancer[trainIndex,]
+
+test<- sample_data_cancer[-trainIndex,]
+
+
+str(train)
+train$D_hepatocellular_carcinoma_dp_dr <- as.factor(train$D_hepatocellular_carcinoma_dp_dr)
+train$sexe <- as.factor(train$sexe)
+train$codeGeo <- as.factor(train$codeGeo)
+
+#sur-échantillonnage 
+
+# Appliquer ROSE pour le suréchantillonnage
+train_data <- ROSE(D_hepatocellular_carcinoma_dp_dr ~ ., data = train, p=1 ,N = 240000)$data
+str(train_data)
+dim(train_data)
+
+#construire le modèle 
+library(parallel)
+library(DoParallel)
+num_cores <- detectCores()
+print(num_cores)
+cl <- makeCluster(7)
+registerDoParallel(cl)
+
+# Divisions des données en sous-ensembles
+
+subsets <- split(train_data, rep(1:num_cores, each = nrow(train_data) / num_cores))
+
+# Fonction pour créer la matrice de conception pour un sous-ensemble de données
+create_design_matrix <- function(subset_data) {
+  model.matrix(~ (sexe + D_alcohol_use_disorders_dp_dr) * ., data = subset_data)
+}
+
+# Appliquez la fonction en parallèle sur les sous-ensembles de données
+design_matrices <- parLapply(cl, subsets, create_design_matrix)
+
+# Fermez le cluster de calcul
+stopCluster(cl)
+
+# Combinez les matrices de conception en une seule
+final_design_matrix <- do.call(rbind, design_matrices)
+#train_modele_matrix <- model.matrix(~ (sexe + D_alcohol_use_disorders_dp_dr) * ., data = train_data)
+
+
+
+
+y_train <- result_train$variable_reponse
+y_train <- factor(y_train)
+
+test_data <- test_data %>%
+  select(-variable_reponse) %>%
+  as.matrix()
+y_test <- test_data$variable_reponse
+y_test <- factor(y_test)
+
+
+#initialiser le lambda 
+loglambda = seq(-10,10,length=100)
+
+#lancement du modèle de régression logistique pénalisé sur LASSO
+spe_data_cancer_cvlasso = cv.glmnet(train_modele_matrix,y_train,family="binomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+summary(spe_data_cancer_cvlasso)
+
+
+#quel est le meilleur lambda plot(spe_data_cancer_cvlasso)
+
+best_lambda <- spe_data_cancer_cvlasso$lambda.min
+
+#plot 
+plot(spe_data_cancer_cvlasso)
+
+# Ajustement du modèle final sur l'ensemble d'entraînement sans utiliser le best lambda 
+model_lasso <- glmnet(x_train, y_train, family = "binomial", lambda = best_lambda, alpha = 1,maxit = 10000)
+
+
+### model obtained with optimal lambda
+
+proba = predict(model_lasso, newx=x_test, type="response", s=best_lambda)
+
+
+predictions = predict(model_lasso,newx=x_test,
+                type="class",s=best_lambda)
+
+head(predictions)   
+
+####évaluation de la performance de prediction 
+
+#utilisation de confusionmatrix
+predictions <- factor(predictions)#convertir en facteur pour appliquer confusionmatrix
+confusionMatrix(predictions,y_test,mode = "everything",positive = "1")
+
+#quels sont les variables sélectionnées 
+coefficient <- coef(spe_data_cancer_cvlasso, s=spe_data_cancer_cvlasso$lambda.min)
+coefficient
+
+variables_explicatives <- sample_data_cancer[, c(
+                 "D_jaundice_dp_dr",
+                 "sexe",
+                 "codeGeo",
+                 "D_cholangitis_dp_dr",
+                 "D_hepatorenal_syndrome_dp_dr",
+                 "D_connective_tissue_disorder_dp_dr",
+                 "D_embolism_and_thrombosis_of_renal_vein_dp_dr",
+                 "D_alcohol_use_disorders_without_K70_dp_dr",
+                 "D_alcohol_use_disorders_dp_dr",
+                 "D_alcoholic_cirrhosis_dp_dr",
+                 "D_chronic_hepatitis_B_dp_dr", 
+                 "D_hepatic_encephalopathy_dp_dr",
+                 "D_lymphoma_dp_dr",
+                 "D_liver_transplantation_dp_dr",
+                 "D_alcohol_rehabilitation_dp_dr",
+                 "D_chronic_hepatitis_C_dp_dr",
+                 "D_budd_chiari_syndrome_dp_dr",
+                 "D_autoimmune_hepatitis_dp_dr",
+                 "D_hypertension_dp_dr",
+                 "D_obesity_dp_dr",
+                 "D_hypercholesterolemia_pure_dp_dr",
+                 "D_smoking_dp_dr",
+                 "D_type_1_diabetes_mellitus_dp_dr",
+                 "D_type_2_diabetes_mellitus_dp_dr",
+                 "D_phlebitis_and_thrombophlebitis_dp_dr",                         
+                  "D_portal_hypertension_dp_dr",                                    
+                  "D_portal_vein_thrombosis_dp_dr",                                  
+                  "D_renal_transplantation_dp_dr",                                  
+                  "D_splanchnic_thrombophlebitis_dp_dr",                            
+                 "D_chronic_hepatitis_D_dp_dr")]
+
+
+variable_reponse <- sample_data_cancer$D_hepatocellular_carcinoma_dp_dr
+
+str(variables_explicatives)
+# Convertir les variables 'sexe' et 'codeGeo' en numériques si elles sont des facteurs
+variables_explicatives <- variables_explicatives %>%
+  mutate_all(~as.numeric(as.character(.)))
+
+
+# Créer les variables d'interaction
+inter_sexe_aud <- interaction(variables_explicatives$sexe,variables_explicatives$D_alcohol_use_disorders_without_K70_dp_dr,drop = TRUE)
+
+inter_sexe_cirhose <- interaction(variables_explicatives$sexe,variables_explicatives$D_alcoholic_cirrhosis_dp_dr,drop = TRUE)
+
+inter_sexe_hepatiteB <- interaction(variables_explicatives$sexe,variables_explicatives$D_chronic_hepatitis_B_dp_dr,drop = TRUE)
+
+inter_sexe_smoking <- interaction(variables_explicatives$sexe,variables_explicatives$D_smoking_dp_dr,drop = TRUE)
+
+
+inter_geo_aud <- interaction(variables_explicatives$codeGeo,variables_explicatives$D_alcohol_use_disorders_without_K70_dp_dr,drop = TRUE)
+
+inter_geo_cirhose <- interaction(variables_explicatives$codeGeo,variables_explicatives$D_alcoholic_cirrhosis_dp_dr,drop = TRUE)
+
+inter_geo_hepatiteB <- interaction(variables_explicatives$codeGeo,variables_explicatives$D_chronic_hepatitis_B_dp_dr,drop = TRUE)
+
+inter_aud_aud_withoutk70 <- interaction(variables_explicatives$D_alcohol_use_disorders_dp_dr,variables_explicatives$D_alcohol_use_disorders_without_K70_dp_dr,drop = TRUE)
+
+
+
+data_cancer_new4 <- cbind(variables_explicatives,variable_reponse,inter_geo_hepatiteB,inter_geo_cirhose,inter_geo_aud,inter_sexe_hepatiteB,inter_sexe_cirhose,inter_sexe_aud,inter_sexe_smoking,inter_aud_aud_withoutk70)
+
+str(data_cancer_new4)
+
+data_cancer_new4 <- data_cancer_new4 %>%
+  mutate_all(~ as.factor(.))
+
+#partition du data 
+trainIndex <- createDataPartition(data_cancer_new4$variable_reponse,p=0.8, list = FALSE, times = 1)
+
+train_data <- data_cancer_new4[trainIndex,]
+
+test_data <- data_cancer_new4[-trainIndex,]
+
+
+str(train_data)
+
+
+#sur-échantillonnage 
+
+# Appliquer ROSE pour le suréchantillonnage
+result_train <- ROSE(variable_reponse ~ ., data = train_data, p=1 ,N = 240000)$data
+str(result)
+
+
+
+#préparer les données 
+x_train <- result_train %>%
+  select(-variable_reponse) %>%
+  as.matrix()
+y_train <- result_train$variable_reponse
+y_train <- factor(y_train)
+
+x_test <- test_data %>%
+  select(-variable_reponse) %>%
+  as.matrix()
+y_test <- test_data$variable_reponse
+y_test <- factor(y_test)
+
+
+
+
+#initialiser le lambda 
+loglambda = seq(-10,10,length=100)
+
+#lancement du modèle de régression logistique pénalisé sur LASSO
+spe_data_cancer_cvlasso = cv.glmnet(x_train,y_train,family="binomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+summary(spe_data_cancer_cvlasso)
+
+
+#quel est le meilleur lambda plot(spe_data_cancer_cvlasso)
+
+best_lambda <- spe_data_cancer_cvlasso$lambda.min
+
+#plot 
+plot(spe_data_cancer_cvlasso)
+
+# Ajustement du modèle final sur l'ensemble d'entraînement sans utiliser le best lambda 
+model_lasso <- glmnet(x_train, y_train, family = "binomial", lambda = best_lambda, alpha = 1,maxit = 10000)
+
+
+### model obtained with optimal lambda
+
+proba = predict(model_lasso, newx=x_test, type="response", s=best_lambda)
+
+
+predictions = predict(model_lasso,newx=x_test,
+                type="class",s=best_lambda)
+
+head(predictions)   
+
+####évaluation de la performance de prediction 
+
+#utilisation de confusionmatrix
+predictions <- factor(predictions)#convertir en facteur pour appliquer confusionmatrix
+confusionMatrix(predictions,y_test,mode = "everything",positive = "1")
+
+#quels sont les variables sélectionnées 
+coefficient <- coef(spe_data_cancer_cvlasso, s=spe_data_cancer_cvlasso$lambda.min)
+coefficient
+```
+##reprendre le modèle p^récédent avec une regression logistique basique 
+```{r}
+library(RcmdrMisc)
+library(boot)
+
+
+sapply(result,unique)
+
+data_cancer_new4 <- data_cancer_new4 %>%
+  select_if(~length(unique(.))>1)
+str(data_cancer_new4)
+
+#partition du data 
+trainIndex <- createDataPartition(data_cancer_new4$variable_reponse,p=0.8, list = FALSE, times = 1)
+
+train_data <- data_cancer_new4[trainIndex,]
+str(train_data)
+test_data <- data_cancer_new4[-trainIndex,]
+head(test_data)
+
+str(train_data)
+
+
+#sur-échantillonnage 
+
+# Appliquer ROSE pour le suréchantillonnage
+result_train <- ROSE(variable_reponse ~ ., data = train_data, p=0.5 ,N = 240000)$data
+str(result)
+
+
+
+#préparer les données 
+x_train <- result_train %>%
+  select(-variable_reponse) %>%
+  as.matrix()
+y_train <- result_train$variable_reponse
+y_train <- factor(y_train)
+
+x_test <- test_data %>%
+  select(-variable_reponse) %>%
+  as.matrix()
+y_test <- test_data$variable_reponse
+y_test <- factor(y_test)
+
+
+#utilisation de glm
+mod0 <- glm(variable_reponse ~ ., data = result_train, family = "binomial")
+str(result)
+
+
+#optimisation du modèle 
+cv.mod0 <- cv.glm(result, mod0)
+
+#optimisation du modèle
+mod_optimise <- stepwise(mod0, direction="forward/backward", criterion="AIC")
+
+predictions = predict(mod_optimise,newx=x_test,
+                type="class")
+
+head(predictions)   
+
+####évaluation de la performance de prediction 
+
+#utilisation de confusionmatrix
+predictions <- factor(predictions)#convertir en facteur pour appliquer confusionmatrix
+confusionMatrix(predictions,y_test,mode = "everything",positive = "1")
+
+#quels sont les variables sélectionnées 
+coefficient <- coef(mod_optimise, s=spe_data_cancer_cvlasso$lambda.min)
+coefficient
+```
+
+
+
+##régression logistique avec elastic net 
+```{r}
+#tester plusieurs alphas 
+alpha_val <- seq(0.5,1,0.1)
+
+
+results <- data.frame(alpha = numeric(), lambda = numeric(), F1score = numeric(), Sensibilite = numeric(), Specificite = numeric())
+
+#boucle de validation croisée pour chaque valeur de alpha qi sera testée 
+for (alpha in alpha_val) {
+  cv_model = cv.glmnet(x_train,y_train,family="binomial",type.measure="deviance",
+                                lambda=exp(loglambda))
+  best_lambda <- cv_model$lambda.min
+
+  model <- glmnet(x_train, y_train, family = "binomial", lambda = best_lambda, alpha = alpha,maxit = 10000)
+  predictions <- predict(model, newx = x_test, type = "class", s = best_lambda)
+  predictions <- factor(predictions, levels = levels(y_test))
+
+  cm <- confusionMatrix(predictions, y_test, mode = "everything", positive = "1")
+  print(cm)
+  F1score <- cm$overall["F1score"]
+  Se <- cm$byClass["Sensitivity"]
+  Sp <- cm$byClass["Specificity"]
+
+  if (!is.na(F1score) && !is.na(Se) && !is.na(Sp)) {
+    results <- rbind(results, data.frame(alpha = alpha, lambda = best_lambda, F1score = F1score, Sensibilite = Se, Specificite = Sp))
+  }
+}
+
+   # Trouver le meilleur modèle basé sur le F1score
+best_model = results[which.max(results$F1score),]
+print(best_model)
+```
+les performances du modèles sont similaires pour chaque alpha,
+une explication serait un manque de diversité dans les solutions trouvées par le modèle. Cela peut se produire si les données ne sont pas suffisamment informatives ou si la régularisation est trop forte. 
+
+Les variables trop nombreuses et la forte colinéarité entre les variables d'intérêt clinique nous pousse à sélectionner des variables en particulier pour la suite des analyses 
+
+
+######analyse de survie 
+intérêt de l'analyse de survie : 
+
+##transformation des données pour appliquer l'analyse de survie 
+```{r}
+#création d'une fonction 
+# Elle utilise la valeur de D_hepatocellular_carcinoma_dp_dr dans la ligne pour la comparer aux autres variables maladie 
+fonction_colonne <- function(colonne, date_reference) {
+  ifelse(!is.na(colonne) & !is.na(date_reference) & colonne < date_reference, 1, 0)
+}
+
+#filtrage et transformation des bases de données 
+#la différence de temps est en jour
+data_cancer_new2 <- copy(data_cancer)%>%
+  dplyr:: select(-starts_with("age_"), -ends_with("_all"),-"anonyme")%>%
+  dplyr:: mutate(across(c("sexe","age.min","age.max","codeGeo","age.max"), ~ as.numeric(.)))%>%
+  dplyr:: mutate(t_diag = D_hepatocellular_carcinoma_dp_dr - D_entry)
+ 
+
+sapply(data_cancer_new2, function(x) sum(is.na(x)))
+
+# Appliquer la fonction à toutes les colonnes de diagnostic pertinentes
+data_cancer_new2 <- data_cancer_new2 %>%
+  dplyr::mutate(
+    # Remplacer les NA par des valeurs spécifiques dans 'codeGeo' et 'sexe'
+    codeGeo = ifelse(is.na(codeGeo), 0, codeGeo),
+    sexe = ifelse(is.na(sexe), 1, sexe),
+    t_diag = ifelse(is.na(t_diag), 0, t_diag),
+    # Appliquer 'fonction_colonne' aux colonnes qui commencent par 'D_'
+    across(setdiff(names(.)[starts_with("D_")], "D_hepatocellular_carcinoma_dp_dr"), 
+           ~ fonction_colonne(., D_hepatocellular_carcinoma_dp_dr))
+  ) %>%
+  # Convertir les colonnes 'D_' en facteurs après l'application de 'fonction_colonne'
+  dplyr::mutate(across(starts_with("D_"), as.factor))
+
+
+sapply(data_cancer_new2, function(x) sum(is.na(x)))
+
+data_cancer_new2 <- data_cancer_new2 %>%
+  dplyr::mutate(across(setdiff(names(.)[starts_with("D_")], "D_hepatocellular_carcinoma_dp_dr"), 
+           ~ ifelse(is.na(.), 0, .))) %>%
+  dplyr::select(-D_hepatocellular_carcinoma_dp_dr, -death)
+
+
+sapply(data_cancer_new2, function(x) sum(is.na(x)))
+
+#####version optimisée du code#########
+data_cancer_new2 <- copy(data_cancer) %>%
+  dplyr::select(-starts_with("age_"), -ends_with("_all"), -"anonyme") %>%
+  dplyr::mutate(
+    across(c("sexe", "age.min", "age.max", "codeGeo", "age.max"), as.numeric),
+    t_diag = D_hepatocellular_carcinoma_dp_dr - D_entry,
+    codeGeo = ifelse(is.na(codeGeo), 0, codeGeo),
+    sexe = ifelse(is.na(sexe), 1, sexe),
+    t_diag = ifelse(is.na(t_diag), 0, t_diag),
+    across(setdiff(names(.)[starts_with("D_")], "D_hepatocellular_carcinoma_dp_dr"), 
+           ~ fonction_colonne(., D_hepatocellular_carcinoma_dp_dr)),
+    across(starts_with("D_"), ~ ifelse(is.na(.), 0, .))
+  ) %>%
+  dplyr::mutate(across(starts_with("D_"), as.factor)) %>%
+  dplyr::mutate(D_hepatocellular_carcinoma_dp_dr = ifelse(is.na(D_hepatocellular_carcinoma_dp_dr),0,1))%>%
+  dplyr::select(-death)
+
+sapply(data_cancer_new2, function(x) sum(is.na(x)))
+str(data_cancer_new2)
+
+```
+```{r}
+unique(data_cancer_new2$D_chronic_hepatitis_B_dp_dr)
+unique(data_cancer_new2$D_acute_kidney_injury_dp_dr)
+sum(data_cancer_new2$D_acute_kidney_injury_dp_dr==2)
+```
+
+#réalisation de l'analyse de survie 
+
+Nous sommes partie des variables les plus significatives obtenues avec LASSO mais en ajoutant les variables cliniquement pertinentes qui n'ont pas été retenues par ce dernier 
+
+on a choisi d'omettre certaines variables d'intérêts cliniques qui présentent une forte colinéarité avec d'autres variables qui elles aussi sont pertinentes cliniquement. 
+on a choisi d'exclure dans l'analyse : 
+solid_tumor_localised_without_liver car fortement corélée avec solid_tumor_localised
+alcool-use_disorder car fortement correlée avec alcool-use_disorder_without_k70
+alcoholic_liver_disease car on part de l'hypothèse que liver_disease_moderate_severe englobe la cirhose alcoolique 
+alcoholic_cirhosis car on part de l'hypothèse que la variable cirhose englobe la cirhose alcoolique 
+```{r}
+library(survival)
+
+survi_obj <- Surv(time=data_cancer_new2$t_diag, event = data_cancer_new2$D_hepatocellular_carcinoma_dp_dr)
+length(data_cancer_new2$t_diag)
+View(data_cancer_new2$D_chronic_hepatitis_B_dp_dr)
+#modèle de cox 
+cox_mod0 <- coxph(survi_obj ~ sexe + D_acute_kidney_injury_dp_dr + D_alcohol_rehabilitation_dp_dr + D_solid_tumor_localised_dp_dr + D_alcohol_use_disorders_dp_dr + D_alcoholic_cirrhosis_dp_dr + D_cirrhosis_dp_dr  + D_chronic_hepatitis_B_dp_dr + D_chronic_hepatitis_C_dp_dr + D_hypertension_dp_dr +
+D_liver_disease_moderate_to_severe_dp_dr + D_liver_transplantation_dp_dr + D_obesity_dp_dr + D_solid_tumor_metastatic_dp_dr, data = data_cancer_new2) 
+
+cox_mod <- coxph(survi_obj ~ D_solid_tumor_localised_without_liver_dp_dr +
+                 D_intrahepatic_bile_duct_carcinoma_dp_dr +
+                 D_jaundice_dp_dr +
+                 D_other_primary_liver_cancer_dp_dr +
+                 sexe +
+                 D_cholangitis_dp_dr +
+                 D_hepatorenal_syndrome_dp_dr +
+                 D_connective_tissue_disorder_dp_dr +
+                 D_embolism_and_thrombosis_of_renal_vein_dp_dr +
+                 D_alcohol_use_disorders_without_K70_dp_dr +
+                 D_alcoholic_liver_disease_dp_dr + 
+                 D_cirrhosis_dp_dr + 
+                 D_chronic_hepatitis_B_dp_dr +   
+                 D_liver_disease_moderate_to_severe_dp_dr + 
+                 D_liver_transplantation_dp_dr +
+                 D_alcohol_rehabilitation_dp_dr +
+                 D_chronic_hepatitis_C_dp_dr +
+                 D_chronic_hepatitis_D_dp_dr,
+                 data = data_cancer_new2)
+
+
+summary(cox_mod0)
+```
+Les p-valeurs pour tous ces facteurs sont inférieures à 0.001, ce qui indique que ces relations sont statistiquement significatives. L'indice de concordance de 0.804 suggère que le modèle a une bonne capacité à discriminer entre les patients qui ont l'événement et ceux qui ne l'ont pas.
+
+sexe: Avec un coef positif de 0.035370, être de sexe masculin (si le sexe masculin est codé comme 1) est associé à une légère augmentation du risque de décès ou de l'événement étudié.
+
+D_acute_kidney_injury_dp_dr1: Un coef négatif de -1.233987 suggère que les patients avec des antécédents d'insuffisance rénale aiguë ont un risque significativement réduit de décès ou de l'événement étudié dans ce modèle, ce qui pourrait paraître contre-intuitif cliniquement. 
+
+D_alcohol_rehabilitation_dp_dr1: Un coef négatif de -0.431891 suggère que les patients ayant subi une réhabilitation pour l'alcoolisme ont un risque réduit, ce qui pourrait être interprété comme le résultat d'une intervention réussie réduisant les risques associés à l'abus d'alcool.
+
+D_solid_tumor_localised_dp_dr1: Avec un coef négatif de -1.671386, cette variable est fortement associée à une réduction du risque, ce qui pourrait indiquer que les tumeurs localisées, qui sont généralement traitables, ont un meilleur pronostic que les tumeurs métastatiques ou plus avancées ?? A creuser 
+
+D_alcohol_use_disorders_dp_dr1: Un coef négatif de -1.218652 suggère également un risque réduit, ce qui pourrait nécessiter une analyse plus approfondie pour comprendre la relation entre les troubles de l'usage de l'alcool et le risque de l'événement étudié.
+
+D_alcoholic_cirrhosis_dp_dr1: Un coef positif de 1.280213 indique une augmentation significative du risque, ce qui est cohérent avec la compréhension clinique que la cirrhose alcoolique est un facteur de risque important pour le cancer hépatocellulaire.
+
+D_cirrhosis_dp_dr1: Un coef négatif de -0.637226 indique une réduction du risque, ce qui est pour le coût contre intuitif...
+
+D_chronic_hepatitis_B_dp_dr1 et D_chronic_hepatitis_C_dp_dr1: Les coefficients négatifs pour ces variables suggèrent un risque réduit, ce qui pourrait être contre-intuitif, car l'hépatite chronique est un facteur de risque connu pour le cancer hépatocellulaire. Cela pourrait indiquer une autre interaction non capturée par le modèle.
+
+D_hypertension_dp_dr1: Le coef négatif de -1.413143 suggère que l'hypertension est associée à une réduction du risque de l'événement étudié, ce qui est une autre découverte potentiellement contre-intuitive qui pourrait nécessiter une enquête plus approfondie.
+
+D_liver_disease_moderate_to_severe_dp_dr1, D_liver_transplantation_dp_dr1, D_obesity_dp_dr1, et D_solid_tumor_metastatic_dp_dr1: Les coefficients négatifs suggèrent un risque réduit associé à ces conditions, ce qui pourrait sembler contre-intuitif, en particulier pour les tumeurs métastatiques et les maladies hépatiques graves. 
+
+en conclusion, il y a des interactions qui n'ont pas étaient capturées par le modèle Cela pourrait indiquer que dans le contexte de l'étude, ces conditions sont associées à d'autres facteurs ou interventions qui influencent le risque.
+
+
+
+
+##réalisation de l'analyse factorielle 
+```{r}
+library(FactoMineR)
+# Convertir x_train en dataframe
+x_train_df <- as.data.frame(x_train)
+
+# Convertir toutes les colonnes en facteurs sauf "age.min", "codeGeo", et "age.max"
+x_train_df <- x_train_df %>% 
+  mutate(across(-c(age.min, codeGeo, age.max), as.factor))
+
+res <- MCA(x_train_df,quanti.sup = c("age.min","codeGeo","age.max"))
+
+par(mar=c(6, 5, 5, 3) + 0.2)
+plot.MCA(res, invisible = "ind",cex = 0.7)
+
+```
+```{r}
+summary(patients_cancer_new$liver_disease_mild_dp_dr)
+```
+
